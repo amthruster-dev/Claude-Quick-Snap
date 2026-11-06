@@ -1,14 +1,11 @@
 import sys
 import io
-import json
 import base64
-import threading
-import os
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
-    QTextEdit, QLineEdit, QSystemTrayIcon, QMenu, QMainWindow, QMessageBox,
-    QRubberBand
+    QTextEdit, QLineEdit, QSystemTrayIcon, QMenu, QMessageBox,
+    QRubberBand, QInputDialog
 )
 from PyQt6.QtGui import QScreen, QPixmap, QPainter, QColor, QAction, QIcon, QGuiApplication
 from PyQt6.QtCore import Qt, QRect, QPoint, QSize, QThread, pyqtSignal, QSettings
@@ -32,10 +29,29 @@ def set_api_key(key):
     get_settings().setValue("api_key", key)
 
 
+def make_icon():
+    pix = QPixmap(64, 64)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QColor("#CC785C"))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawEllipse(4, 4, 56, 56)
+    p.setPen(QColor("white"))
+    font = p.font()
+    font.setBold(True)
+    font.setPointSize(26)
+    p.setFont(font)
+    p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "C")
+    p.end()
+    return QIcon(pix)
+
+
 # ---------- Region selector overlay ----------
 class RegionSelector(QWidget):
     """Full-screen transparent overlay for dragging a capture rectangle."""
     region_selected = pyqtSignal(QPixmap)
+    cancelled = pyqtSignal()
 
     def __init__(self, screen: QScreen):
         super().__init__()
@@ -59,6 +75,7 @@ class RegionSelector(QWidget):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
+            self.cancelled.emit()
             self.close()
 
     def mousePressEvent(self, event):
@@ -77,9 +94,9 @@ class RegionSelector(QWidget):
         self.close()
 
         if rect.width() < 5 or rect.height() < 5:
-            return  # too small, treat as cancel
+            self.cancelled.emit()
+            return
 
-        # crop from the full-resolution pixmap, accounting for device pixel ratio
         dpr = self.full_pixmap.devicePixelRatio()
         crop_rect = QRect(
             int(rect.x() * dpr), int(rect.y() * dpr),
@@ -135,24 +152,43 @@ class ClaudeWorker(QThread):
             self.error.emit(str(e))
 
 
-# ---------- Result window ----------
-class ResultWindow(QWidget):
-    def __init__(self, pixmap: QPixmap):
+# ---------- Main window ----------
+class MainWindow(QWidget):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(520, 600)
-        self.pixmap = pixmap
+        self.setWindowIcon(make_icon())
+        self.resize(560, 640)
+
+        self.pixmap = None
+        self.worker = None
+        self.selector = None
 
         layout = QVBoxLayout(self)
 
-        # thumbnail preview
-        thumb = QLabel()
-        scaled = pixmap.scaledToWidth(480, Qt.TransformationMode.SmoothTransformation)
-        if scaled.height() > 240:
-            scaled = pixmap.scaledToHeight(240, Qt.TransformationMode.SmoothTransformation)
-        thumb.setPixmap(scaled)
-        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(thumb)
+        title = QLabel("Claude Quick Snap")
+        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.addWidget(title)
+
+        btn_row = QHBoxLayout()
+        self.snap_region_btn = QPushButton("Snap Region")
+        self.snap_region_btn.clicked.connect(self.snap_region)
+        btn_row.addWidget(self.snap_region_btn)
+
+        self.snap_full_btn = QPushButton("Snap Full Screen")
+        self.snap_full_btn.clicked.connect(self.snap_full_screen)
+        btn_row.addWidget(self.snap_full_btn)
+
+        self.api_key_btn = QPushButton("Set API Key")
+        self.api_key_btn.clicked.connect(self.set_api_key_dialog)
+        btn_row.addWidget(self.api_key_btn)
+        layout.addLayout(btn_row)
+
+        self.thumb = QLabel("No screenshot yet. Click 'Snap Region' or 'Snap Full Screen'.")
+        self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumb.setMinimumHeight(220)
+        self.thumb.setStyleSheet("border: 1px solid #555; border-radius: 6px; color: #888;")
+        layout.addWidget(self.thumb)
 
         prompt_row = QHBoxLayout()
         self.prompt_input = QLineEdit()
@@ -162,6 +198,7 @@ class ResultWindow(QWidget):
 
         self.send_btn = QPushButton("Send")
         self.send_btn.clicked.connect(self.send_to_claude)
+        self.send_btn.setEnabled(False)
         prompt_row.addWidget(self.send_btn)
         layout.addLayout(prompt_row)
 
@@ -174,16 +211,50 @@ class ResultWindow(QWidget):
         self.status.setStyleSheet("color: gray;")
         layout.addWidget(self.status)
 
-        self.prompt_input.setFocus()
-        self.worker = None
+        if not get_api_key():
+            self.status.setText("No API key set. Click 'Set API Key' to get started.")
 
+    # --- capture ---
+    def snap_full_screen(self):
+        screen = QGuiApplication.primaryScreen()
+        pixmap = screen.grabWindow(0)
+        self.set_pixmap(pixmap)
+
+    def snap_region(self):
+        self.hide()
+        screen = QGuiApplication.primaryScreen()
+        self.selector = RegionSelector(screen)
+        self.selector.region_selected.connect(self.on_region_selected)
+        self.selector.cancelled.connect(self.on_region_cancelled)
+        self.selector.showFullScreen()
+
+    def on_region_selected(self, pixmap):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.set_pixmap(pixmap)
+
+    def on_region_cancelled(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def set_pixmap(self, pixmap):
+        self.pixmap = pixmap
+        scaled = pixmap.scaledToWidth(520, Qt.TransformationMode.SmoothTransformation)
+        if scaled.height() > 220:
+            scaled = pixmap.scaledToHeight(220, Qt.TransformationMode.SmoothTransformation)
+        self.thumb.setPixmap(scaled)
+        self.send_btn.setEnabled(True)
+        self.prompt_input.setFocus()
+
+    # --- send ---
     def send_to_claude(self):
+        if self.pixmap is None:
+            return
         api_key = get_api_key()
         if not api_key:
-            QMessageBox.warning(
-                self, APP_NAME,
-                "No API key set. Right-click the tray icon and choose 'Set API Key'."
-            )
+            QMessageBox.warning(self, APP_NAME, "No API key set. Click 'Set API Key' first.")
             return
 
         buf = io.BytesIO()
@@ -210,103 +281,49 @@ class ResultWindow(QWidget):
         self.status.setText("Error.")
         self.send_btn.setEnabled(True)
 
-
-# ---------- Tray application ----------
-class QuickSnapApp:
-    def __init__(self):
-        self.app = QApplication(sys.argv)
-        self.app.setQuitOnLastWindowClosed(False)
-
-        self.tray = QSystemTrayIcon()
-        self.tray.setIcon(self._make_icon())
-        self.tray.setToolTip(APP_NAME)
-
-        menu = QMenu()
-
-        snap_full_action = QAction("Snap Full Screen", menu)
-        snap_full_action.triggered.connect(self.snap_full_screen)
-        menu.addAction(snap_full_action)
-
-        snap_region_action = QAction("Snap Region (drag to select)", menu)
-        snap_region_action.triggered.connect(self.snap_region)
-        menu.addAction(snap_region_action)
-
-        menu.addSeparator()
-
-        set_key_action = QAction("Set API Key", menu)
-        set_key_action.triggered.connect(self.set_api_key_dialog)
-        menu.addAction(set_key_action)
-
-        menu.addSeparator()
-
-        quit_action = QAction("Quit", menu)
-        quit_action.triggered.connect(self.app.quit)
-        menu.addAction(quit_action)
-
-        self.tray.setContextMenu(menu)
-        self.tray.activated.connect(self.on_tray_activated)
-        self.tray.show()
-
-        self.selector = None
-        self.result_windows = []
-
-        if not get_api_key():
-            self.tray.showMessage(
-                APP_NAME,
-                "No API key set yet. Right-click the tray icon to add one.",
-                QSystemTrayIcon.MessageIcon.Information,
-                5000,
-            )
-
-    def _make_icon(self):
-        pix = QPixmap(64, 64)
-        pix.fill(Qt.GlobalColor.transparent)
-        p = QPainter(pix)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QColor("#CC785C"))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(4, 4, 56, 56)
-        p.setPen(QColor("white"))
-        font = p.font()
-        font.setBold(True)
-        font.setPointSize(26)
-        p.setFont(font)
-        p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "C")
-        p.end()
-        return QIcon(pix)
-
-    def on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self.snap_region()
-
-    def snap_full_screen(self):
-        screen = QGuiApplication.primaryScreen()
-        pixmap = screen.grabWindow(0)
-        self.open_result_window(pixmap)
-
-    def snap_region(self):
-        screen = QGuiApplication.primaryScreen()
-        self.selector = RegionSelector(screen)
-        self.selector.region_selected.connect(self.open_result_window)
-        self.selector.showFullScreen()
-
-    def open_result_window(self, pixmap: QPixmap):
-        win = ResultWindow(pixmap)
-        self.result_windows.append(win)
-        win.show()
-        win.raise_()
-        win.activateWindow()
-
     def set_api_key_dialog(self):
-        from PyQt6.QtWidgets import QInputDialog
         current = get_api_key()
         text, ok = QInputDialog.getText(
-            None, APP_NAME, "Enter your Anthropic API key:",
+            self, APP_NAME, "Enter your Anthropic API key:",
             QLineEdit.EchoMode.Password, current
         )
         if ok and text.strip():
             set_api_key(text.strip())
-            QMessageBox.information(None, APP_NAME, "API key saved.")
+            self.status.setText("API key saved.")
+
+
+# ---------- App entry point ----------
+class QuickSnapApp:
+    def __init__(self):
+        self.app = QApplication(sys.argv)
+        self.app.setQuitOnLastWindowClosed(True)
+
+        self.window = MainWindow()
+
+        # optional tray icon for quick access, non-essential
+        self.tray = QSystemTrayIcon(make_icon())
+        self.tray.setToolTip(APP_NAME)
+        menu = QMenu()
+        show_action = QAction("Show Claude Quick Snap", menu)
+        show_action.triggered.connect(self.show_window)
+        menu.addAction(show_action)
+        quit_action = QAction("Quit", menu)
+        quit_action.triggered.connect(self.app.quit)
+        menu.addAction(quit_action)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.on_tray_activated)
+        self.tray.show()
+
+        self.window.show()
+
+    def show_window(self):
+        self.window.show()
+        self.window.raise_()
+        self.window.activateWindow()
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.show_window()
 
     def run(self):
         sys.exit(self.app.exec())
